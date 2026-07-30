@@ -821,6 +821,8 @@ class CodeSandboxRewardWorker(Worker):
         have_thinks = []
         prompts_text_list = self.tokenizer.batch_decode(data.batch["prompts"], skip_special_tokens=True)
         response_text_list = self.tokenizer.batch_decode(data.batch["responses"], skip_special_tokens=True)
+        cached_livecodebench_path = None
+        cached_livecodebench_tests = None
         for i, (prompt_id, prompt_txt, response, case_type, test_cases, test_case_function, tag) in enumerate(
             zip(
                 data.non_tensor_batch["id"],
@@ -834,7 +836,21 @@ class CodeSandboxRewardWorker(Worker):
         ):
             if isinstance(test_cases, str):
                 test_cases = json.loads(test_cases)
-                
+
+            if case_type == "livecodebench":
+                if not isinstance(test_cases, list) or len(test_cases) != 1:
+                    raise ValueError(f"Invalid LiveCodeBench test descriptor for prompt {prompt_id!r}")
+                cache_path = test_cases[0].get("cache_path")
+                if not cache_path:
+                    raise ValueError(f"LiveCodeBench cache path is missing for prompt {prompt_id!r}")
+                if cache_path != cached_livecodebench_path:
+                    from roll.datasets.geppo_code import load_livecodebench_tests
+
+                    cached_livecodebench_tests = load_livecodebench_tests(cache_path)
+                    cached_livecodebench_path = cache_path
+                test_cases, test_case_function = cached_livecodebench_tests
+                case_type = "input"
+
             if "livecodebench" in tag or self.use_local:
                 correct, info, error_info = cal_local_test(
                     global_step, prompt_id, prompt_txt, response, case_type, test_cases, test_case_function

@@ -123,7 +123,9 @@ def _hf_verify_math_sample(response, answer, result, prompt):
            => 默认值: False (不抛出异常，返回空列表)
            => 建议：保持默认值，确保程序的健壮性，不会因单个样本出错而中断。
         """
-        parsed_answers = parse(cleaned_response, fallback_mode="no_fallback")
+        boxed_found, boxed_answer = check_and_extract_within_boxed(cleaned_response)
+        answer_to_parse = f"${boxed_answer}$" if boxed_found else cleaned_response
+        parsed_answers = parse(answer_to_parse, fallback_mode="no_fallback")
         
         # 如果解析结果为空，则认为提取失败
         if not parsed_answers:
@@ -204,6 +206,40 @@ def format_reward_fn(text: str, pattern: Optional[str] = r"^<think>.*?</think>.*
     return reward
 
 
+def check_and_extract_within_boxed(response: str, boxed_start_list=None):
+    """Return whether the last boxed expression is balanced and its contents."""
+    if boxed_start_list is None:
+        boxed_start_list = (r"\boxed{", r"\boxed\{")
+
+    boxed_content_start_index = -1
+    for boxed_start in boxed_start_list:
+        last_boxed_index = response.rfind(boxed_start)
+        if last_boxed_index != -1:
+            boxed_content_start_index = last_boxed_index + len(boxed_start)
+            break
+    if boxed_content_start_index == -1:
+        return False, ""
+
+    brace_depth = 0
+    in_quote = False
+    for index in range(boxed_content_start_index, len(response)):
+        char = response[index]
+        if char == '"':
+            in_quote = not in_quote
+        elif not in_quote and char == "{":
+            brace_depth += 1
+        elif not in_quote and char == "}":
+            if brace_depth == 0:
+                return True, response[boxed_content_start_index:index]
+            brace_depth -= 1
+    return False, response[boxed_content_start_index:]
+
+
+def boxed_format_reward_fn(text: str, boxed_start_list=None):
+    is_valid, extracted_content = check_and_extract_within_boxed(text, boxed_start_list)
+    return 0 if is_valid and extracted_content.strip() else -1
+
+
 class MathRuleRewardWorker(Worker):
     """
     (x)Reward Model 使用 AutoModelForSequenceClassification 协议
@@ -218,6 +254,8 @@ class MathRuleRewardWorker(Worker):
         self.strategy: Optional[Union[InferenceStrategy, TrainStrategy]] = None
         self.repetition_penalty_reward_fn = get_repetition_penalty_reward(ngram_size=3, max_penalty=-0.1)
         self.format_pattern = getattr(self.worker_config, "format_pattern", None)
+        self.format_reward_type = getattr(self.worker_config, "format_reward_type", "format")
+        self.response_level_reward_type = getattr(self.worker_config, "response_level_reward_type", "01")
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def initialize(self, pipeline_config):
@@ -266,7 +304,10 @@ class MathRuleRewardWorker(Worker):
             else:
                 verify_answer.append(0)
             repetition_penalty_rewards.append(self.repetition_penalty_reward_fn(response))
-            format_rewards.append(format_reward_fn(response, self.format_pattern))
+            if self.format_reward_type == "boxed":
+                format_rewards.append(boxed_format_reward_fn(response))
+            else:
+                format_rewards.append(format_reward_fn(response, self.format_pattern))
             long_block_penalty_rewards.append(long_block_penalty_reward_fn(response))
             response_length_rewards.append(len(response) / 20000)
             
@@ -276,13 +317,29 @@ class MathRuleRewardWorker(Worker):
         long_block_penalty_rewards = torch.tensor(long_block_penalty_rewards, dtype=torch.float16)
         format_rewards = torch.tensor(format_rewards, dtype=torch.float16)
         scores = torch.tensor(verify_answer, dtype=torch.float16)
-        response_level_rewards = torch.tensor(verify_answer, dtype=torch.float16)
+        if self.response_level_reward_type == "soft":
+            response_level_rewards = torch.full_like(scores, -1.0)
+            response_level_rewards = torch.where(
+                (scores == 1) & (format_rewards == 0), torch.tensor(1.0, dtype=scores.dtype), response_level_rewards
+            )
+            response_level_rewards = torch.where(
+                (scores == 1) & (format_rewards < 0), torch.tensor(0.5, dtype=scores.dtype), response_level_rewards
+            )
+            response_level_rewards = torch.where(
+                (scores == 0) & (format_rewards == 0), torch.tensor(-0.5, dtype=scores.dtype), response_level_rewards
+            )
+        else:
+            response_level_rewards = scores.clone()
 
         output = DataProto.from_dict(
             tensors={
                 "token_level_rewards": token_level_rewards,
                 "response_level_rewards": response_level_rewards,
                 "scores": scores,
+                "format_rewards": format_rewards,
+                "long_block_penalty_rewards": long_block_penalty_rewards,
+                "repetition_penalty_rewards": repetition_penalty_rewards,
+                "response_length_rewards": response_length_rewards,
             }
         )
 

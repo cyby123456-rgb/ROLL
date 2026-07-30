@@ -39,6 +39,7 @@ def get_chat_template(key, tokenizer: "PreTrainedTokenizer"):
 def native_chat_template(tokenizer: "PreTrainedTokenizer", conversation, tools=None, documents=None, **kwargs):
     kwargs["tokenize"] = False
     kwargs["add_generation_prompt"] = kwargs.get("add_generation_prompt", True)
+    kwargs["enable_thinking"] = False
     return tokenizer.apply_chat_template(conversation, tools, documents, **kwargs)
 
 @register_chat_template("qwen3")
@@ -54,6 +55,7 @@ def dpo_chat_template(tokenizer: "PreTrainedTokenizer", conversation, tools=None
 
     # Disable generation prompt ('<|assistant|>') to avoid redundant tokens in DPO training
     kwargs["add_generation_prompt"] = kwargs.get("add_generation_prompt", False)
+    kwargs["enable_thinking"] = False
 
     return tokenizer.apply_chat_template(conversation, tools, documents, **kwargs)
 

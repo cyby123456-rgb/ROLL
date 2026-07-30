@@ -23,7 +23,7 @@ from vllm.utils import random_uuid
 from roll.distributed.executor.worker import Worker
 from roll.distributed.scheduler.protocol import DataProto, list_of_dict_to_dict_of_list
 from roll.distributed.strategy.strategy import InferenceStrategy
-from roll.third_party.vllm import LLM, AsyncLLM
+from roll.third_party.vllm import AsyncLLM, LLM, normalize_inference_quantization
 from roll.utils.functionals import GenerateRequestType, concatenate_input_and_output, reduce_metrics
 from roll.utils.logging import get_logger
 from roll.utils.offload_states import OffloadStateType
@@ -67,6 +67,7 @@ class VllmStrategy(InferenceStrategy):
             dtype = "bfloat16"
         else:
             dtype = "auto"
+        vllm_config, dtype = normalize_inference_quantization(vllm_config, dtype)
         vllm_config.update(
             {
                 "model": self.worker_config.model_args.model_name_or_path,

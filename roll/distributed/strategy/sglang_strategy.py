@@ -32,6 +32,15 @@ except:
 logger = get_logger()
 
 
+def _ensure_event_loop():
+    try:
+        return asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        return loop
+
+
 class SgLangStrategy(InferenceStrategy):
     strategy_name = "sglang"
 
@@ -45,6 +54,7 @@ class SgLangStrategy(InferenceStrategy):
         self.sglang_outputs_list: List = []
         self.input_ids_list: List = []
         self.command_queue: Optional[queue.Queue] = None
+        self.event_loop = None
 
         self.request_ids = set()
         self.generation_config = None
@@ -109,7 +119,6 @@ class SgLangStrategy(InferenceStrategy):
             {"additional_special_tokens": special_tokens}, replace_additional_special_tokens=False
         )
         logger.info(f"add {special_tokens} to additional_special_tokens: {self.tokenizer.additional_special_tokens}")
-        self.event_loop = asyncio.get_event_loop()
 
     def op_compute_log_probs(self, logits: torch.Tensor, input_ids: torch.Tensor, attention_mask: torch.Tensor):
         pass
@@ -117,6 +126,7 @@ class SgLangStrategy(InferenceStrategy):
     def start_server(self, data: DataProto, request_complete_callback):
         self.running = True
         self.command_queue = queue.Queue()
+        self.event_loop = _ensure_event_loop()
         async_engine.start_async_sglang(
             self.event_loop,
             self.model,
@@ -237,6 +247,7 @@ class SgLangStrategy(InferenceStrategy):
     def load_states(self, *args, **kwargs):
         self.model.flush_cache()
         if not self.model.is_model_in_gpu:
+            _ensure_event_loop()
             self.model.resume_memory_occupation()
             logger.info("self.model.resume_memory_occupation exec ....")
             self.model.is_model_in_gpu = True
@@ -244,6 +255,7 @@ class SgLangStrategy(InferenceStrategy):
     def offload_states(self, include=None, non_blocking=False):
         if include is None or OffloadStateType.model_params in include:
             if self.worker.pipeline_config.is_train_infer_colocated and self.model.is_model_in_gpu:
+                _ensure_event_loop()
                 self.model.release_memory_occupation()
                 logger.info("self.model.release_memory_occupation exec ....")
                 self.model.is_model_in_gpu = False
@@ -279,7 +291,7 @@ def concatenate_input_and_output(input_ids, output_ids, num_return_sequences):
 
 
 def create_sampling_params_for_sglang(gen_kwargs: dict):
-    return dict(
+    params = dict(
         max_new_tokens=gen_kwargs["max_new_tokens"],
         temperature=gen_kwargs["temperature"],
         top_p=gen_kwargs["top_p"],
@@ -287,10 +299,13 @@ def create_sampling_params_for_sglang(gen_kwargs: dict):
         stop_token_ids=gen_kwargs["eos_token_id"],
         repetition_penalty=gen_kwargs["repetition_penalty"],
         n=gen_kwargs["num_return_sequences"],
-        return_logprob=gen_kwargs.get("logprobs", 0) > 0,
         stop=gen_kwargs["stop_strings"],
         no_stop_trim=gen_kwargs.get("include_stop_str_in_output", True),
     )
+    # Some SGLang versions reject return_logprob=False; only request it when needed.
+    if gen_kwargs.get("logprobs", 0) > 0:
+        params["return_logprob"] = True
+    return params
 
 
 def compare_sampling_params(params1: dict, params2: dict) -> bool:

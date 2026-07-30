@@ -877,7 +877,7 @@ class RequestScheduler:
         self.need_suspend = False
         self.suspend_notifier = asyncio.Event()
 
-    async def generate_one_request(self, data: DataProto):
+    async def _dispatch_request(self, data: DataProto):
         await self._check_suspend()
 
         src_rank = data.meta_info["src_rank"]
@@ -892,10 +892,25 @@ class RequestScheduler:
         self.request_id_2_dp_rank[request_id] = dp_rank
         self.inflight_requests[dp_rank][request_id] = fut
         ref = self.infer_cluster.workers[dp_rank].add_request.remote(command=GenerateRequestType.ADD, data=data)
-        await asyncio.wrap_future(ref.future())
+        try:
+            await asyncio.wrap_future(ref.future())
+        except Exception:
+            self.request_id_2_dp_rank.pop(request_id, None)
+            self.inflight_requests[dp_rank].pop(request_id, None)
+            raise
         response_data = await fut
         if response_data is None:
             # request aborted
+            return None
+        return response_data
+
+    async def generate_raw_request(self, data: DataProto):
+        """Dispatch one request and return the inference callback payload unchanged."""
+        return await self._dispatch_request(data)
+
+    async def generate_one_request(self, data: DataProto):
+        response_data = await self._dispatch_request(data)
+        if response_data is None:
             return None
 
         # postprocess_generate, input_ids, attention_mask, left pad

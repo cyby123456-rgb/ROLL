@@ -366,6 +366,18 @@ class PPOConfig(BaseConfig):
     use_reward_scaling: bool = field(default=False, metadata={"help": "Use reward scaling"})
     add_len_reward: bool = field(default=False)
     reward_clip: float = field(default=None, metadata={"help": "reward clip value."})
+    reward_importance_sampling: bool = field(
+        default=False,
+        metadata={"help": "Apply sequence-level train/infer IS to rewards before normalization."},
+    )
+    grpo_importance_sampling: bool = field(
+        default=False,
+        metadata={"help": "Use train/infer IS-weighted statistics for GRPO reward normalization."},
+    )
+    snis_importance_sampling: bool = field(
+        default=False,
+        metadata={"help": "Use self-normalized train/infer IS statistics for group reward normalization."},
+    )
     use_reward_norm: bool = field(
         default=False, metadata={"help": "Use reward normalization. Only applicable if use_reward_scaling is True."}
     )
@@ -407,6 +419,16 @@ class PPOConfig(BaseConfig):
 
     def __post_init__(self):
         super().__post_init__()
+
+        reward_is_modes = sum(
+            bool(getattr(self, name, False))
+            for name in ("reward_importance_sampling", "grpo_importance_sampling", "snis_importance_sampling")
+        )
+        if reward_is_modes > 1:
+            raise ValueError(
+                "reward_importance_sampling, grpo_importance_sampling, and "
+                "snis_importance_sampling are mutually exclusive"
+            )
 
         if (
             self.actor_train.model_args.model_name_or_path is None

@@ -142,13 +142,26 @@ def move_tensors_to_device(data, device):
     return data
 
 
+def make_non_tensor_array(values: List[Any]) -> np.ndarray:
+    """Build the protocol's 1-D object array without NumPy inferring nested axes."""
+    result = np.empty(len(values), dtype=object)
+    for index, value in enumerate(values):
+        result[index] = value
+    return result
+
+
 def custom_np_concatenate(val):
     concatenated_list = []
     for array in val:
         concatenated_list.extend(array)
-    concatenated_array = np.empty(len(concatenated_list), dtype=object)
-    concatenated_array[:] = concatenated_list
-    return concatenated_array
+    return make_non_tensor_array(concatenated_list)
+
+
+def repeat_non_tensor_value(value: Any, repeat_times: int) -> np.ndarray:
+    """Repeat one metadata object without flattening nested lists or arrays."""
+    if repeat_times < 0:
+        raise ValueError(f"repeat_times must be non-negative, got {repeat_times}")
+    return make_non_tensor_array([value] * repeat_times)
 
 
 @dataclass

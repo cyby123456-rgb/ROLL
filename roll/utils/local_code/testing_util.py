@@ -20,7 +20,19 @@ from unittest.mock import mock_open, patch
 from roll.utils.local_code.execute_utils import BASE_IMPORTS
 
 import numpy as np
-from pyext import RuntimeModule
+
+try:
+    from pyext import RuntimeModule
+except ImportError:
+    from types import ModuleType
+
+    class RuntimeModule:
+        @staticmethod
+        def from_string(module_name: str, module_path: str, source: str) -> ModuleType:
+            module = ModuleType(module_name)
+            module.__file__ = module_path or f"<{module_name}>"
+            exec(compile(source, module.__file__, "exec"), module.__dict__)
+            return module
 
 
 def truncatefn(s, length=300):

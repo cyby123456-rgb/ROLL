@@ -1,9 +1,10 @@
 import math
 import os
 import random
+import copy
 from collections import defaultdict
 from functools import partial
-from typing import Callable, Dict, Iterator, List, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 import numpy as np
 import ray
@@ -475,6 +476,30 @@ class MegatronInferStrategy(InferenceStrategy):
                 # DataProto.to('cuda') in upper frame not work for non_tensor_batch
                 forward_args[key] = torch.concat(multi_modal_data[key], dim=0).to(input_ids.device)
             forward_args.update({"force_vit_image": True})
+
+        if attention_mask is not None:
+            transformer_impl = getattr(self.megatron_train_args, "transformer_impl", None)
+            logger.error(
+                "[debug_attention_mask] worker=%s impl=%s input_shape=%s input_dtype=%s",
+                getattr(self.worker, "worker_name", None),
+                transformer_impl,
+                tuple(attention_mask.shape),
+                attention_mask.dtype,
+            )
+            if transformer_impl == "local" and attention_mask.dim() == 2:
+                valid_tokens = attention_mask.bool()
+                seq_len = valid_tokens.size(1)
+                causal_mask = torch.triu(
+                    torch.ones((seq_len, seq_len), device=valid_tokens.device, dtype=torch.bool),
+                    diagonal=1,
+                )
+                attention_mask = (
+                    causal_mask.unsqueeze(0).unsqueeze(0)
+                    | (~valid_tokens).unsqueeze(1).unsqueeze(2)
+                    | (~valid_tokens).unsqueeze(1).unsqueeze(3)
+                )
+            elif transformer_impl == "local" and attention_mask.dtype is not torch.bool:
+                attention_mask = attention_mask.bool()
 
         output_tensor = model(
             input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids, labels=labels,
@@ -962,6 +987,11 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
         self.models_unwrapped = None
         self.processor = None
         self._validate_access_integrity = True
+        self._guard_model_state = None
+        self._guard_optimizer_state = None
+        self._guard_inner_optimizer_state = None
+        self._guard_scheduler_state = None
+        self._guard_rng_state = None
 
     def initialize(self, model_provider):
         self.seq_length = self.worker.pipeline_config.sequence_length
@@ -1179,6 +1209,148 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
             "broadcast": broadcast_time_cost,
         }
         return metrics
+
+    @staticmethod
+    def _clone_guard_value(value):
+        if isinstance(value, torch.Tensor):
+            return value.detach().cpu().clone()
+        if isinstance(value, dict):
+            return {key: MegatronTrainStrategy._clone_guard_value(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [MegatronTrainStrategy._clone_guard_value(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(MegatronTrainStrategy._clone_guard_value(item) for item in value)
+        if isinstance(value, np.ndarray):
+            return value.copy()
+        return copy.deepcopy(value)
+
+    @staticmethod
+    def _move_guard_value(value, device):
+        if isinstance(value, torch.Tensor):
+            return value.to(device=device)
+        if isinstance(value, dict):
+            return {key: MegatronTrainStrategy._move_guard_value(item, device) for key, item in value.items()}
+        if isinstance(value, list):
+            return [MegatronTrainStrategy._move_guard_value(item, device) for item in value]
+        if isinstance(value, tuple):
+            return tuple(MegatronTrainStrategy._move_guard_value(item, device) for item in value)
+        return value
+
+    def sync_to_guard(self):
+        """Save model, optimizer, scheduler and RNG state on CPU for rollback."""
+        self.load_states()
+        self.model.models = self.models_unwrapped
+        self._guard_model_state = {
+            f"model{index}": self._clone_guard_value(model.state_dict_for_save_checkpoint())
+            for index, model in enumerate(self.models_unwrapped)
+        }
+        self.model.models = self.models_wrapped
+        try:
+            self._guard_optimizer_state = self._clone_guard_value(self.optimizer.state_dict())
+        except AssertionError as exc:
+            # Native torch DistributedOptimizer can have mixed per-parameter step
+            # counters, while Megatron's wrapper state_dict asserts they are equal.
+            # The inner optimizer state is saved below and is the rollback-critical
+            # parameter state, so keep guard usable instead of failing here.
+            logger.warning(f"skip Megatron optimizer wrapper state in guard: {exc}")
+            self._guard_optimizer_state = None
+        # Megatron DistributedOptimizer.state_dict() intentionally excludes
+        # parameter-dependent states (fp32 master weights and Adam moments).
+        # Keep the underlying torch optimizer shard as well so rollback does
+        # not silently restore only the scheduler/step metadata.
+        self._guard_inner_optimizer_state = None
+        if self.megatron_train_args.use_distributed_optimizer:
+            inner_states = []
+            for optimizer in self._get_optimizer_list_for_guard():
+                inner_optimizer = getattr(optimizer, "optimizer", None)
+                if inner_optimizer is None or not hasattr(inner_optimizer, "state_dict"):
+                    inner_states = None
+                    break
+                inner_states.append(self._clone_guard_value(inner_optimizer.state_dict()))
+            self._guard_inner_optimizer_state = inner_states
+        self._guard_scheduler_state = self._clone_guard_value(self.scheduler.state_dict())
+        self._guard_rng_state = {
+            "random": copy.deepcopy(random.getstate()),
+            "numpy": self._clone_guard_value(np.random.get_state()),
+            "torch": self._clone_guard_value(torch.get_rng_state()),
+            "cuda": self._clone_guard_value(current_platform.get_rng_state()),
+        }
+        current_platform.synchronize()
+
+    def sync_from_guard(self):
+        """Restore the last CPU guard snapshot."""
+        if self._guard_model_state is None:
+            raise RuntimeError("Guard state not saved; call sync_to_guard first")
+        self.load_states()
+        self.model.models = self.models_unwrapped
+        if len(self.models_unwrapped) == 1:
+            model_state = self._move_guard_value(
+                self._guard_model_state["model0"], current_platform.device_type
+            )
+        else:
+            model_state = {
+                key: self._move_guard_value(value, current_platform.device_type)
+                for key, value in self._guard_model_state.items()
+            }
+        self.model.load_state_dict(model_state, strict=False)
+        self.model.models = self.models_wrapped
+        if self._guard_optimizer_state is not None:
+            self.optimizer.load_state_dict(self._move_guard_value(self._guard_optimizer_state, current_platform.device_type))
+        if self._guard_inner_optimizer_state is not None:
+            for optimizer, state in zip(
+                self._get_optimizer_list_for_guard(), self._guard_inner_optimizer_state
+            ):
+                inner_optimizer = getattr(optimizer, "optimizer", None)
+                if inner_optimizer is not None and hasattr(inner_optimizer, "load_state_dict"):
+                    inner_optimizer.load_state_dict(
+                        self._move_guard_value(state, current_platform.device_type)
+                    )
+        if self._guard_scheduler_state is not None:
+            self.scheduler.load_state_dict(self._move_guard_value(self._guard_scheduler_state, current_platform.device_type))
+        if self._guard_rng_state is not None:
+            random.setstate(self._guard_rng_state["random"])
+            np.random.set_state(self._guard_rng_state["numpy"])
+            torch.set_rng_state(self._guard_rng_state["torch"])
+            current_platform.set_rng_state(self._guard_rng_state["cuda"])
+        current_platform.synchronize()
+
+    def compute_update_norm_from_guard(self) -> Optional[float]:
+        if self._guard_model_state is None:
+            return None
+        update_sq_sum = 0.0
+        for index, model in enumerate(self.models_unwrapped):
+            current_state = model.state_dict_for_save_checkpoint()
+            guard_state = self._guard_model_state.get(f"model{index}", {})
+            for key, current_value in current_state.items():
+                guard_value = guard_state.get(key)
+                if isinstance(current_value, torch.Tensor) and isinstance(guard_value, torch.Tensor):
+                    update_sq_sum += float((current_value.detach().cpu().float() - guard_value.float()).pow(2).sum())
+        return float(update_sq_sum ** 0.5)
+
+    def set_learning_rate(self, learning_rate: float):
+        if learning_rate <= 0:
+            raise ValueError(f"learning_rate must be positive, got {learning_rate}")
+        old_lrs = []
+        for optimizer in self._get_optimizer_list_for_guard():
+            for param_group in getattr(optimizer, "param_groups", []):
+                old_lrs.append(param_group.get("lr"))
+                param_group["lr"] = learning_rate
+            torch_optimizer = getattr(optimizer, "optimizer", None)
+            for param_group in getattr(torch_optimizer, "param_groups", []):
+                old_lrs.append(param_group.get("lr"))
+                param_group["lr"] = learning_rate
+        if hasattr(self.scheduler, "_last_lr"):
+            self.scheduler._last_lr = [learning_rate for _ in old_lrs]
+        self.megatron_train_args.learning_rate = learning_rate
+        self.worker_config.training_args.learning_rate = learning_rate
+        return {"old_lr": old_lrs[0] if old_lrs else None, "new_lr": learning_rate}
+
+    def _get_optimizer_list_for_guard(self):
+        from megatron.core.optimizer import ChainedOptimizer
+
+        if isinstance(self.optimizer, ChainedOptimizer):
+            return list(self.optimizer.chained_optimizers)
+        return [self.optimizer]
 
     def load_states(self, include=None, non_blocking=False):
         if include is not None:

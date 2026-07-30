@@ -1,6 +1,7 @@
 import vllm
 from packaging.version import Version
 
+from roll.third_party.vllm.quantization import normalize_inference_quantization
 from roll.utils.logging import get_logger
 
 logger = get_logger()
@@ -27,4 +28,4 @@ elif Version("0.11.1rc2.dev0+gc3a722fcb.d20251021") == Version(vllm.__version__)
 else:
     raise NotImplementedError(f"roll vllm version {vllm.__version__} is not supported.")
 
-__all__ = ["LLM", "AsyncLLM"]
+__all__ = ["LLM", "AsyncLLM", "normalize_inference_quantization"]

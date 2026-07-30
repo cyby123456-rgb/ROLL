@@ -312,21 +312,21 @@ def get_pad_mask(response_id: torch.Tensor, pad_token: int = 0, eos_token: int =
     e.g. pad token=0
     response_id: [1, 2, 2, 42, 3, 5, 1, 0, 0]
     pad_mask:     [1, 1, 1, 1,  1, 1, 1, 0, 0]
-    
+
     If eos_token == pad_token, the first pad token (which is the eos token) should be kept.
     e.g. pad_token=0, eos_token=0
     response_id: [1, 2, 2, 42, 3, 5, 0, 0, 0]
     pad_mask:     [1, 1, 1, 1,  1, 1, 1, 0, 0]  (first pad token/eos token is kept)
     """
     pad_mask = response_id.not_equal(pad_token).to(dtype)
-    
+
     # eos_token == pad_token, 需要保留第一个pad token否则会误将eos token mask掉
     if eos_token == pad_token:
         pad_positions = response_id.eq(pad_token).to(dtype)
         cumsum_pad = torch.cumsum(pad_positions, dim=-1)
         first_pad_token = (cumsum_pad == 1).to(dtype)
         pad_mask = pad_mask | first_pad_token
-    
+
     assert (
         not (pad_mask[:, 0] == 0).logical_and(pad_mask.sum(-1) != 0).any()
     ), f"response_id is not valid: {response_id}, pad_token is {pad_token}"
@@ -365,25 +365,25 @@ def response_level_masked_whiten(values: torch.Tensor, mask: torch.Tensor, shift
 def reduce_metrics(metrics: dict, reduce_func=np.mean) -> dict:
     """
     Reduce metrics with enhanced aggregation support based on metric name suffixes.
-    
+
     Supported suffixes:
     - _mean: arithmetic mean (default)
     - _max: maximum value
-    - _min: minimum value  
+    - _min: minimum value
     - _p50: 50th percentile (median)
     - _p99: 99th percentile
     - _std: standard deviation
     - _sum: sum of all values
-    
+
     Args:
         metrics: Dictionary of metric names to lists/tensors of values
         reduce_func: Default reduction function (used for metrics without suffix)
-    
+
     Returns:
         Dictionary with reduced metric values
     """
     import numpy as np
-    
+
     def _parse_suffix(metric_name):
         """Parse aggregation method from metric name suffix."""
         if metric_name.endswith('_mean'):
@@ -402,8 +402,29 @@ def reduce_metrics(metrics: dict, reduce_func=np.mean) -> dict:
             return np.sum
         else:
             return reduce_func
-    
+
+    # Combine distributed Welford accumulators before applying suffix rules.
+    welford_keys = set()
+    for key in list(metrics.keys()):
+        if not key.endswith("_n"):
+            continue
+        base = key[:-2]
+        sum_key = base + "_sum"
+        sum_sq_key = base + "_sum_sq"
+        var_key = base + "_var"
+        if sum_key not in metrics or sum_sq_key not in metrics:
+            continue
+        n = float(np.asarray(metrics[key]).sum())
+        total = float(np.asarray(metrics[sum_key]).sum())
+        total_sq = float(np.asarray(metrics[sum_sq_key]).sum())
+        mean = total / n if n else 0.0
+        metrics[var_key] = (total_sq / n - mean * mean) if n > 1 else 0.0
+        welford_keys.update((key, sum_key, sum_sq_key))
+
     for key, val in metrics.items():
+        if key in welford_keys:
+            metrics[key] = float(np.asarray(val).sum())
+            continue
         if isinstance(val, (list, tuple, np.ndarray)) and len(val) > 0:
             # Use suffix-based aggregation if available
             aggregation_func = _parse_suffix(key)
@@ -411,8 +432,21 @@ def reduce_metrics(metrics: dict, reduce_func=np.mean) -> dict:
         else:
             # Fallback to default reduction function
             metrics[key] = reduce_func(val)
-    
+
     return metrics
+
+
+def reduce_metrics_list(metrics_list: list, reduce_func=np.mean) -> dict:
+    """Reduce a list of metric dictionaries without assuming identical keys."""
+    if not metrics_list:
+        return {}
+    keys = set().union(*(metrics.keys() for metrics in metrics_list))
+    merged = {}
+    for key in keys:
+        values = [metrics[key] for metrics in metrics_list if key in metrics]
+        arrays = [np.asarray(value).reshape(-1) for value in values]
+        merged[key] = reduce_func(np.concatenate(arrays))
+    return reduce_metrics(merged, reduce_func=reduce_func)
 
 
 def pad_to_length(tensor: torch.Tensor, length, pad_value, dim=-1):
@@ -516,10 +550,27 @@ def expand_to_token_level(data: "DataProto"):
     return token_level_rewards
 
 
-def reward_norm(response_level_rewards: torch.Tensor, n_sample=-1, running_ctrl={}, norm_mean_type=None, norm_std_type=None):
+def reward_norm(
+    response_level_rewards: torch.Tensor,
+    n_sample=-1,
+    running_ctrl={},
+    norm_mean_type=None,
+    norm_std_type=None,
+    importance_sampling_ratio: Optional[torch.Tensor] = None,
+    grpo_importance_sampling_ratio: Optional[torch.Tensor] = None,
+    snis_importance_sampling_ratio: Optional[torch.Tensor] = None,
+):
+    """Normalize rewards with optional sequence-level IS/TIS weighting."""
+    if importance_sampling_ratio is not None:
+        response_level_rewards = response_level_rewards * importance_sampling_ratio
+
     group_mode = (norm_mean_type == "group") or (norm_std_type == "group")
     if group_mode and n_sample > 0:
         reshape_reward = response_level_rewards.reshape(*response_level_rewards.size()[:-1], -1, n_sample)
+        if grpo_importance_sampling_ratio is not None:
+            weighted_rewards = (response_level_rewards * grpo_importance_sampling_ratio).reshape(
+                *response_level_rewards.size()[:-1], -1, n_sample
+            )
     if norm_mean_type == "running" or norm_std_type == "running":
         running = running_ctrl["domain"]
         running.update(response_level_rewards)
@@ -527,7 +578,13 @@ def reward_norm(response_level_rewards: torch.Tensor, n_sample=-1, running_ctrl=
     if norm_mean_type == "batch":
         reward_mean = response_level_rewards.mean()
     elif norm_mean_type == "group":
-        reward_mean = reshape_reward.mean(dim=-1, keepdim=True)
+        if grpo_importance_sampling_ratio is not None:
+            reward_mean = weighted_rewards.mean(dim=-1, keepdim=True)
+        elif snis_importance_sampling_ratio is not None:
+            weights = snis_importance_sampling_ratio.reshape(*reshape_reward.shape)
+            reward_mean = (weights * reshape_reward).sum(dim=-1, keepdim=True) / (weights.sum(dim=-1, keepdim=True) + 1e-8)
+        else:
+            reward_mean = reshape_reward.mean(dim=-1, keepdim=True)
     elif norm_mean_type == "running":
         reward_mean = running.mean
     elif norm_mean_type == None:
@@ -536,17 +593,24 @@ def reward_norm(response_level_rewards: torch.Tensor, n_sample=-1, running_ctrl=
     if norm_std_type == "batch":
         reward_std = response_level_rewards.std()
     elif norm_std_type == "group":
-        reward_std = torch.std(reshape_reward, dim=-1, keepdim=True)
+        if grpo_importance_sampling_ratio is not None:
+            reward_std = torch.std(weighted_rewards, dim=-1, keepdim=True)
+        elif snis_importance_sampling_ratio is not None:
+            weights = snis_importance_sampling_ratio.reshape(*reshape_reward.shape)
+            variance = (weights * (reshape_reward - reward_mean) ** 2).sum(dim=-1, keepdim=True)
+            reward_std = torch.sqrt(variance / (weights.sum(dim=-1, keepdim=True) + 1e-8) + 1e-8)
+        else:
+            reward_std = torch.std(reshape_reward, dim=-1, keepdim=True)
     elif norm_std_type == "running":
         reward_std = running.std
     # 选择基础奖励值
     rewards = reshape_reward if norm_mean_type == "group" else response_level_rewards
     # 标准化奖励
     if norm_std_type is not None:
-        normalized_rewards = (rewards - reward_mean) / (reward_std + 1e-6) 
-    else: 
+        normalized_rewards = (rewards - reward_mean) / (reward_std + 1e-6)
+    else:
         normalized_rewards = (rewards - reward_mean)
-    
+
     # 如果是对 group mean 归一化，需要恢复原始形状
     if norm_mean_type == "group":
         normalized_rewards = normalized_rewards.reshape(*response_level_rewards.size())
@@ -608,13 +672,35 @@ def reward_postprocess(data: "DataProto", pipeline_config: RLVRConfig, running_c
     if pipeline_config.adv_estimator == "grpo":
         pipeline_config.norm_mean_type, pipeline_config.norm_std_type = "group", "group"
 
+    old_log_probs = data.batch.get("old_log_probs")
+    infer_log_probs = data.batch.get("infer_logprobs", old_log_probs)
+    response_mask = data.batch.get("response_mask")
+    if old_log_probs is not None and infer_log_probs is not None and response_mask is not None:
+        response_mask = response_mask[:, 1:]
+        log_ratio_geo = masked_mean(old_log_probs - infer_log_probs, response_mask, dim=-1).clamp(max=10.0)
+    else:
+        log_ratio_geo = None
+
+    reward_is_ratio = log_ratio_geo.exp() if log_ratio_geo is not None and getattr(
+        pipeline_config, "reward_importance_sampling", False
+    ) else None
+    grpo_is_ratio = log_ratio_geo.exp() if log_ratio_geo is not None and getattr(
+        pipeline_config, "grpo_importance_sampling", False
+    ) else None
+    snis_is_ratio = log_ratio_geo.exp() if log_ratio_geo is not None and getattr(
+        pipeline_config, "snis_importance_sampling", False
+    ) else None
+
     response_level_rewards = reward_norm(
-                    response_level_rewards, 
-                    n_sample=pipeline_config.actor_infer.generating_args.num_return_sequences,
-                    running_ctrl=running_ctrl,
-                    norm_mean_type=pipeline_config.norm_mean_type,
-                    norm_std_type=pipeline_config.norm_std_type
-                    )
+        response_level_rewards,
+        n_sample=pipeline_config.actor_infer.generating_args.num_return_sequences,
+        running_ctrl=running_ctrl,
+        norm_mean_type=pipeline_config.norm_mean_type,
+        norm_std_type=pipeline_config.norm_std_type,
+        importance_sampling_ratio=reward_is_ratio,
+        grpo_importance_sampling_ratio=grpo_is_ratio,
+        snis_importance_sampling_ratio=snis_is_ratio,
+    )
 
     # 对reward进行clip
     if pipeline_config.reward_clip:
@@ -736,6 +822,7 @@ def compute_advantage(
     whiten_advantages=False,
     whiten_rewards=False,
     response_mask=None,
+    pipeline_config=None,
 ):
     if response_mask is None:
         response_mask = data.batch["response_mask"][:, 1:]

@@ -40,5 +40,12 @@ def test_dynamic_batching():
     assert tuple(micro_batch0.batch["input_ids"].shape) == (2,4)
 
 
+def test_dynamic_batching_loss_scale():
+    data = DataProto.from_dict(tensors={"input_ids": torch.zeros(4, 8)})
+    data.meta_info["micro_batch_indices"] = [[0, 2], [2, 4]]
+    assert get_dynamic_batching_loss_scale(data, "seq-mean-token-sum") == 2.0
+    assert get_dynamic_batching_loss_scale(data, "token-mean") is None
+
+
 if __name__ == "__main__":
     test_dynamic_batching()

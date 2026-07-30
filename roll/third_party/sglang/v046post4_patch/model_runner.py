@@ -5,6 +5,7 @@ import torch.distributed as dist
 import datetime
 
 from roll.platforms import current_platform
+from roll.third_party.sglang.fp8 import patch_sglang_fp8_weight_loader
 
 from sglang.srt.model_executor.model_runner import ModelRunner, UNBALANCED_MODEL_LOADING_TIMEOUT_S
 from sglang.srt.configs.device_config import DeviceConfig
@@ -175,6 +176,7 @@ class ModelRunnerSA(ModelRunner):
     def update_parameter(self, parameter_name, weight, ranks_in_worker):
         if dist.get_rank() not in ranks_in_worker:
             return True, "Succeeded to update_parameter."
+        patch_sglang_fp8_weight_loader(self.model)
         self.model.load_weights([(parameter_name, weight)])
         del weight
         return True, "Succeeded to update_parameter."
@@ -186,5 +188,6 @@ class ModelRunnerSA(ModelRunner):
         self.recv_manager = getattr(self, "recv_manager", RecvBucketManager())
         named_params = self.recv_manager.process_bucket(meta_infos, buffer)
         del buffer
+        patch_sglang_fp8_weight_loader(self.model)
         self.model.load_weights([(name, weight) for name, weight in named_params.items()])
         return True, "Succeeded to update_parameter_in_bucket."

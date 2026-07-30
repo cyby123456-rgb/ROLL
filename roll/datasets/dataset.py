@@ -10,6 +10,9 @@ from roll.utils.logging import get_logger
 logger = get_logger()
 
 REGISTERED_DATASETS: Dict[str, Callable[[List[str], str, dict], Union[Dataset, IterableDataset]]] = {}
+REGISTERED_DATASET_ADAPTERS: Dict[
+    str, Callable[[List[str], str, "DataArguments"], Union[Dataset, IterableDataset]]
+] = {}
 
 
 def register_dataset(key: str):
@@ -17,6 +20,16 @@ def register_dataset(key: str):
         if key in REGISTERED_DATASETS:
             raise ValueError(f"Dataset type '{key}' already exists!")
         REGISTERED_DATASETS[key] = func
+        return func
+
+    return decorator
+
+
+def register_dataset_adapter(key: str):
+    def decorator(func: Callable[[List[str], str, "DataArguments"], Union[Dataset, IterableDataset]]):
+        if key in REGISTERED_DATASET_ADAPTERS:
+            raise ValueError(f"Dataset adapter '{key}' already exists!")
+        REGISTERED_DATASET_ADAPTERS[key] = func
         return func
 
     return decorator
@@ -60,6 +73,11 @@ def get_dataset(data_args: "DataArguments"):
                 data_path = FILEEXT2TYPE.get(file_name.split(".")[-1], None)
             elif data_path != FILEEXT2TYPE.get(file_name.split(".")[-1], None):
                 raise ValueError("File types should be identical.")
+
+    if isinstance(dataset_type, str) and dataset_type in REGISTERED_DATASET_ADAPTERS:
+        logger.info(f"load_data_files: {chr(10)} {chr(10).join(data_files)}")
+        logger.info(f"dataset adapter: {dataset_type}")
+        return REGISTERED_DATASET_ADAPTERS[dataset_type](data_files, split="train", data_args=data_args)
 
     if data_path not in REGISTERED_DATASETS:
         raise ValueError(
@@ -163,3 +181,7 @@ def default_text_dataset(
         **kwargs
 ) -> Union["Dataset", "IterableDataset"]:
     return load_dataset("text", data_files=data_files, **kwargs)[split]
+
+
+# Import adapter modules after the registries are initialized.
+from roll.datasets import geppo_code as _geppo_code  # noqa: E402,F401

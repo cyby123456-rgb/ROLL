@@ -4,7 +4,13 @@ import numpy as np
 import pytest
 import torch
 
-from roll.utils.functionals import traverse_obj, divide_by_chunk_size, pad_to_length
+from roll.utils.functionals import (
+    traverse_obj,
+    divide_by_chunk_size,
+    pad_to_length,
+    reduce_metrics,
+    reduce_metrics_list,
+)
 
 
 def visitor(obj: object, path: Tuple):
@@ -53,6 +59,18 @@ def test_pad_to_length():
 
     padded_tensor = pad_to_length(tensor, length, pad_value, dim=-1)
     print(padded_tensor)
+
+
+def test_reduce_metrics_welford_stats():
+    metrics = reduce_metrics({"reward_n": [2, 3], "reward_sum": [4, 6], "reward_sum_sq": [10, 20]})
+    assert metrics["reward_n"] == 5.0
+    assert metrics["reward_sum"] == 10.0
+    assert metrics["reward_var"] == pytest.approx(2.0)
+
+
+def test_reduce_metrics_list_with_partial_keys():
+    metrics = reduce_metrics_list([{"score_mean": [1.0, 3.0]}, {"score_mean": [5.0]}])
+    assert metrics["score_mean"] == pytest.approx(3.0)
 
 
 if __name__ == "__main__":

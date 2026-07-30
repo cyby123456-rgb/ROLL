@@ -30,7 +30,11 @@ class DataArguments:
     )
     dataset_type: Optional[Union[List[str], str]] = field(
         default="json",
-        metadata={"help": "The dataset type, for example, json."},
+        metadata={"help": "The dataset format or a registered dataset adapter, for example json or geppo_code."},
+    )
+    livecodebench_data_dir: Optional[str] = field(
+        default=None,
+        metadata={"help": "Directory containing per-question LiveCodeBench pickle files."},
     )
     tag: Optional[str] = field(default="tag", metadata={"help": "Which column in file to use as domain selection"})
     id: Optional[str] = field(default="id", metadata={"help": "Which column in file to use as id"})

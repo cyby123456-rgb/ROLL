@@ -5,6 +5,21 @@ import torch
 from roll.distributed.scheduler.protocol import DataProto
 
 
+def get_dynamic_batching_loss_scale(data: DataProto, loss_agg_mode: str):
+    """Scale sequence-sum losses back to the logical mini-batch size."""
+    if loss_agg_mode != "seq-mean-token-sum":
+        return None
+    micro_batch_indices = data.meta_info.get("micro_batch_indices")
+    if not micro_batch_indices:
+        return None
+    start = micro_batch_indices[0][0]
+    end = micro_batch_indices[-1][-1]
+    mini_batch_size = max(end - start, 1)
+    num_micro_batches = len(micro_batch_indices)
+    micro_batch_size = data.batch.batch_size[0]
+    return num_micro_batches * micro_batch_size / mini_batch_size
+
+
 def dynamic_batching_shard(
     origin_batch: DataProto,
     dp_size: int,

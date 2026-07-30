@@ -68,3 +68,36 @@ def dump_rollout_to_specific_path(path: str, global_step: int, data: DataProto, 
         if checker(path):
             p = multiprocessing.Process(target=func, args=(path, write_data, COLUMMNS_CONFIG), daemon=True)
             p.start()
+
+
+def dump_batch_to_reward_system(data: DataProto, tokenizer):
+    """Optionally dump reward inputs locally as JSON-safe records.
+
+    The newer edit tree sends these records to an external HTTP service. The
+    current code line has no reward-system client, so only an explicit local
+    path is honored and no network request is made implicitly.
+    """
+    config = data.meta_info.get("reward_system_config", {}) if data.meta_info else {}
+    output_path = config.get("local_path")
+    if not output_path:
+        return
+    os.makedirs(output_path, exist_ok=True)
+    responses = tokenizer.batch_decode(data.batch["responses"], skip_special_tokens=True)
+    scores = data.batch.get("scores")
+    records = []
+    for index, response in enumerate(responses):
+        record = {
+            "global_step": data.meta_info.get("global_step", 0),
+            "response": response,
+        }
+        if scores is not None:
+            record["score"] = float(scores[index].detach().cpu().item())
+        if data.non_tensor_batch:
+            for key, values in data.non_tensor_batch.items():
+                value = values[index]
+                record[key] = value.item() if hasattr(value, "item") else value
+        records.append(record)
+    path = os.path.join(output_path, f"reward_batch.step_{data.meta_info.get('global_step', 0)}.jsonl")
+    with open(path, "w", encoding="utf-8") as file:
+        for record in records:
+            file.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")

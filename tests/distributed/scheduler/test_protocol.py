@@ -3,7 +3,12 @@ import torch
 import numpy as np
 from tensordict import TensorDict
 
-from roll.distributed.scheduler.protocol import DataProto, custom_np_concatenate
+from roll.distributed.scheduler.protocol import (
+    DataProto,
+    custom_np_concatenate,
+    make_non_tensor_array,
+    repeat_non_tensor_value,
+)
 from roll.utils.functionals import reduce_metrics
 
 
@@ -118,6 +123,27 @@ def test_np_concat():
     val = [array1, array2, array3]
     t = custom_np_concatenate(val)
     print(t.shape)
+
+
+def test_repeat_nested_non_tensor_value_keeps_one_value_per_response():
+    test_cases = [{"stdin": str(index), "expected_stdout": str(index)} for index in range(31)]
+    prompt_metadata = make_non_tensor_array([test_cases] * 32)
+    assert prompt_metadata.shape == (32,)
+
+    outputs = []
+    for prompt_test_cases in prompt_metadata:
+        outputs.append(
+            DataProto(
+                batch=TensorDict({"responses": torch.zeros(8, 2)}, batch_size=[8]),
+                non_tensor_batch={"test_cases": repeat_non_tensor_value(prompt_test_cases, 8)},
+            )
+        )
+
+    merged = DataProto.concat(outputs)
+
+    assert merged.batch.batch_size[0] == 256
+    assert merged.non_tensor_batch["test_cases"].shape == (256,)
+    assert all(value is test_cases for value in merged.non_tensor_batch["test_cases"])
 
 def test_concat_global_keys_dict():
     """Test dict-valued metrics aggregation across ranks."""

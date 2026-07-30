@@ -3,52 +3,70 @@ hydra:
     dir: .
   output_subdir: null
 
-exp_name: "qwen3-8B-rlvr-config"
+exp_name: "qwen3-1p7B-rlvr-config"
 seed: 42
 logging_dir: ./output/logs
 output_dir: ./output
 system_envs:
   USE_MODELSCOPE: '1'
+  WANDB_MODE: offline
+  # W&B creates its `wandb/` directory under this root.
+  WANDB_DIR: /mnt/shared-storage-user/liujinyi/lj/ROLL
 
 
 checkpoint_config:
   type: file_system
-  output_dir: /data/cpfs_0/rl_examples/models/${exp_name}
+  output_dir: /mnt/shared-storage-user/liujinyi/lj/ckpt
 
-track_with: tensorboard
+track_with: wandb
 tracker_kwargs:
-  log_dir: ./rl_examples/llm/tensorboard/roll_exp/rlvr
+  mode: offline
+  log_dir: /mnt/shared-storage-user/liujinyi/lj/ROLL
 
-num_gpus_per_node: 8
+num_gpus_per_node: 4
 
-max_steps: 500
+max_steps: 800
 save_steps: 100
 logging_steps: 1
-eval_steps: 10
+eval_steps: 25
 resume_from_checkpoint: false
 
 
 rollout_batch_size: 64  # prompt
-prompt_length: 2048
-response_length: 4096
+prompt_length: 512
+response_length: 8192
 
 num_return_sequences_in_group: 8
 ppo_epochs: 1
-adv_estimator: "reinforce"
-
+adv_estimator: "grpo"
+loss_agg_mode: "seq-mean-token-mean"
+grpo_importance_sampling: false #对优势要不要做is，不设置时即不做
+# importance_sampling: "seq" #算loss的时候的is要seq还是tok？
+reward_importance_sampling: false #对reward normalization前要不要做is
+snis_importance_sampling: false #对reward normalization前要不要做is
+use_kl_loss: true
+kl_loss_coef: 0.001
+use_mismatch_forward_kl_loss: False
+use_mismatch_reverse_kl_loss: False
+mismatch_kl_loss_coef: 0.001
+mismatch_kl_is_ratio_clip_high: 10.0
 # clip
 value_clip: 0.5
 reward_clip: 10
-advantage_clip: 2.0
+
 dual_clip_loss: true
 
 # normalize
-norm_mean_type: ~
-norm_std_type: ~
+norm_mean_type: group
+norm_std_type: group
+
+# rl_loss_coef: 0.0
+# postive_loss_coef: 1
+# use_topr_neg_loss_coef: 1
 
 # data mask
-max_len_mask: true
-difficulty_mask: true
+max_len_mask: false
+difficulty_mask: false
 difficulty_low_threshold: 0.1
 difficulty_high_threshold: 0.95
 error_max_len_clip: false
@@ -57,31 +75,92 @@ error_max_len_clip: false
 difficulty_loss_weight: false
 length_loss_weight: false
 
+train_infer_ratio_mask: false
+train_infer_ratio_threshold_low: 0.0
+train_infer_ratio_threshold_high: 2.0
+
+train_infer_ratio_trunc_is: true
+train_infer_ratio_trunc_is_low: 0
+train_infer_ratio_trunc_is_high: 2.0
+train_infer_ratio_trunc_is_normalize: false
+
+
+train_infer_ratio_trunc_reverse_is: false
+train_infer_ratio_trunc_reverse_is_low: 0.5
+train_infer_ratio_trunc_reverse_is_high: 500000
+# train_infer_ratio_trunc_reverse_is_high: .inf
+train_infer_ratio_trunc_reverse_is_normalize: true
+
+# pg_clip_high: 0.12
+# pg_clip_low: 0.12
+# use_pg_clip_range: true
 # reward
 add_token_level_kl: false
 
 # advantage
-whiten_advantages: true
+whiten_advantages: false
+
+base_log_probs_mode: "old"
+
+# is_correction: "vanilla"
+# ===== Update Validation (Scale Aligner) =====
+# 更新验证机制：在每次模型更新后验证优势值，若低于阈值则回退
+
+lr_decay_for_baseline: false
+lr_decay_for_baseline_decay_steps: 234
+lr_decay_for_baseline_min_lr: 1.0e-7
+
+update_validation:
+  lr_adaptation_enable: false
+  lr_adaptation_window: 100
+  lr_adaptation_interval: 25
+  lr_adaptation_high_rollback_rate: 0.5
+  lr_adaptation_low_rollback_rate: 0.1
+  lr_adaptation_decrease_factor: 0.8
+  lr_adaptation_increase_factor: 1.1
+  lr_adaptation_min_lr: 1e-7
+  lr_adaptation_max_lr: 2e-6
+  random_rollback_enable: false
+  random_rollback_prob: 0.7      # 随机回滚 20%
+  random_rollback_seed: 42
+  enable: true                        # 是否启用更新验证，设为true开启
+  batch_size: 32                       # 验证用的prompt数量
+  num_return_sequences: 8              # 每个prompt生成的response数量
+  advantage_threshold_percentile: 00.0 # 阈值分位数（25表示使用第25百分位）
+  min_steps_for_threshold: 1          # 收集多少步数据后才开始验证
+  buffer_size: 200                      # 优势值历史buffer大小
+  data_mode: "random_per_step"
+  acceptance_advantage_threshold: -0.00001
+  acceptance_advantage_threshold_mode: "fixed"  # "fixed" | "reverse_decay"
+  acceptance_advantage_threshold_reverse_decay_start: -0.0001  # reverse_decay 起点 a
+  acceptance_advantage_threshold_reverse_decay_end: 0     # reverse_decay 终点 b（逐步逼近）
+  acceptance_advantage_threshold_reverse_decay_steps: 100   # 线性上升步数，达到后固定在 end
+  est_mode: "on-policy"
+  offpolicy_rollout_n: 2
+  generate_mode: "legacy"  # "legacy" | "scheduler"
+  generate_concurrency: 64
+  # is_level: "seq-geo"                      # importance sampling级别: "token" 或 "seq"
+  # device_mapping_override: [4, 5, 6, 7]  # actor_train_guard 使用的 GPU，避免与 actor_train (0-7) colocated
 
 # dynamic sampling scheduler
 # use_additional_prompts: true
 # max_running_requests: 256
 # is_num_return_sequences_expand: false
 
-pretrain: Qwen/Qwen3-8B
-reward_pretrain: Qwen/Qwen3-8B
+pretrain: /mnt/shared-storage-user/liujinyi/models_hf/Qwen3-1.7B
+reward_pretrain: /mnt/shared-storage-user/liujinyi/models_hf/Qwen3-1.7B
 
 validation:
   data_args:
-    template: qwen3
+    template: qwen2_5
     file_name:
-      - data/math_benchmarks.jsonl
+      - data/math_benchmarks_0710_newest.jsonl   # TODO: 改成自己的验证集
   generating_args:
     max_new_tokens: ${response_length}
-    top_p: 0.6
-    top_k: 50
+    top_p: 1
+    top_k: -1
     num_beams: 1
-    temperature: 0.6
+    temperature: 0.7
     num_return_sequences: 1
 
 
@@ -93,24 +172,23 @@ actor_train:
   training_args:
     learning_rate: 1.0e-6
     weight_decay: 0
-    per_device_train_batch_size: 1
-    gradient_accumulation_steps: 32
-    warmup_steps: 20
+    # weight_decay: 0   # 设为 >0 即 AdamW 风格（Megatron 的 adam + weight_decay）
+    # # 优化器参数：放这里即可，Megatron 用 training_args + strategy_config 合并后的 config
+    # optimizer: adamw
+    # adam_beta1: 0.9
+    # adam_beta2: 0.95
+    # adam_epsilon: 1.0e-15
+    per_device_train_batch_size: 1  # 已为 1，再减只能靠 TP/PP
+    gradient_accumulation_steps: 32 # 若增大 TP（DP 变小），可适当增大以保持有效 batch
+    lr_scheduler_type: "constant_with_warmup"
+    warmup_steps: 0
     num_train_epochs: 50
   data_args:
-    template: qwen3
-    file_name:
-      - data/code_KodCode_data.jsonl
-      - data/llm_judge_Multi-subject-RLVR_deal_new.jsonl
-      - data/math_deepmath_deal.jsonl
-      - data/general_ifeval_train_deal.jsonl
-      - data/general_CrossThink-QA_deal.jsonl
+    template: qwen2_5
+    file_name:   # TODO: 改成自己要用的训练集
+      - data/dapo_train_qwen3-1p7b_20_80_5759.jsonl
     domain_interleave_probs:
-      math_rule: 0.4
-      code_sandbox: 0.3
-      llm_judge: 0.1
-      crossthinkqa: 0.1
-      ifeval: 0.1
+      math_rule: 1
     dataset_dir: data
     messages: messages
     interleave_probs: "1.0"
@@ -118,13 +196,14 @@ actor_train:
   strategy_args:
     strategy_name: megatron_train
     strategy_config:
-      tensor_model_parallel_size: 1
-      pipeline_model_parallel_size: 1
+      # 增大 TP/PP 可显著降低单卡显存，避免 OOM（总 GPU 数 = DP*TP*PP = 8）
+      tensor_model_parallel_size: 1   # 改为 2 或 4：模型/优化器分片，每卡显存↓，DP 会变小
+      pipeline_model_parallel_size: 1 # 改为 2：层数分阶段，每卡激活显存↓
       expert_model_parallel_size: 1
       use_distributed_optimizer: true
       recompute_granularity: full
-  device_mapping: list(range(0,16))
-  infer_batch_size: 4
+  device_mapping: list(range(0,4))
+  infer_batch_size: 4  # 若仍 OOM 可改为 2，减小 old_log_probs 等计算时的 batch
 
 actor_infer:
   model_args:
@@ -132,21 +211,24 @@ actor_infer:
     dtype: bf16
   generating_args:
     max_new_tokens: ${response_length}
-    top_p: 0.99
-    top_k: 100
+    top_p: 1
+    top_k: -1
     num_beams: 1
-    temperature: 0.99
+    temperature: 1
     num_return_sequences: ${num_return_sequences_in_group}
   data_args:
-    template: qwen3
+    template: qwen2_5
   strategy_args:
     strategy_name: vllm
     strategy_config:
-      gpu_memory_utilization: 0.8
+      gpu_memory_utilization: 0.6
       block_size: 16
-      max_model_len: 8000
-  device_mapping: list(range(0,12))
+      # quantization: fp8  # supported ROLL modes: fp8, int8, fp16
+  device_mapping: list(range(0,4))
   infer_batch_size: 1
+  # system_envs:
+  #   VLLM_USE_FLASHINFER_SAMPLER: '0'
+  #   # VLLM_ATTENTION_BACKEND: 'FLASH_ATTN'  # for rollout pipeline 乱码，https://project.aone.alibaba-inc.com/v2/project/2024841/req#viewIdentifier=ac7b94c92e09d6e47465ca5a&openWorkitemIdentifier=76902745
 
 reference:
   model_args:
@@ -154,38 +236,17 @@ reference:
     dtype: bf16
     model_type: ~
   data_args:
-    template: qwen3
+    template: qwen2_5
   strategy_args:
     strategy_name: megatron_infer
     strategy_config:
       tensor_model_parallel_size: 1
       pipeline_model_parallel_size: 1
       expert_model_parallel_size: 1
-  device_mapping: list(range(0,16))
+  device_mapping: list(range(0,4))
   infer_batch_size: 4
 
 rewards:
-  crossthinkqa:
-    worker_cls: roll.pipeline.rlvr.rewards.crossthinkqa_rule_reward_worker.CrossThinkQARuleRewardWorker
-    reward_type: soft
-    response_length_penalty_coef: 0.0
-    model_args:
-      model_name_or_path: ${reward_pretrain}
-    data_args:
-      template: qwen3
-    tag_included: [crossthinkqa]
-    world_size: 8
-    infer_batch_size: 4
-  ifeval:
-    worker_cls: roll.pipeline.rlvr.rewards.ifeval_rule_reward_worker.GeneralRuleRewardWorker
-    reward_type: soft
-    model_args:
-      model_name_or_path: ${reward_pretrain}
-    data_args:
-      template: qwen3
-    tag_included: [ifeval]
-    world_size: 8
-    infer_batch_size: 4
   math_rule:
     worker_cls: roll.pipeline.rlvr.rewards.math_rule_reward_worker.MathRuleRewardWorker
     model_args:
@@ -193,47 +254,18 @@ rewards:
     data_args:
       template: qwen3
     tag_included: [deepmath_103k, aime]
-    world_size: 8
+    world_size: 4
     infer_batch_size: 1
-  code_sandbox:
-    use_local: true
-    worker_cls: roll.pipeline.rlvr.rewards.code_sandbox_reward_worker.CodeSandboxRewardWorker
-    tag_included: [KodCode]
-    model_args:
-      model_name_or_path: ${reward_pretrain}
-    data_args:
-      template: qwen3
-    world_size: 8
-    infer_batch_size: 1
-  llm_judge:
-    # NOTE: llm as judge 也需要gpu, 不能和actor infer共享gpu
-    worker_cls: roll.pipeline.rlvr.rewards.llm_judge_reward_worker.LLMJudgeRewardWorker
-    judge_prompt: Qwen2.5-7B-Instruct-RLVR-prompt
-    judge_model_type: inference
-    tag_included: [RLVR]
-    model_args:
-      model_name_or_path: virtuoussy/Qwen2.5-7B-Instruct-RLVR
-      attn_implementation: fa2
-      disable_gradient_checkpointing: true
-      dtype: bf16
-      model_type: trl
-    generating_args:
-      max_new_tokens: 100
-      top_p: 0.8
-      top_k: 50
-      num_beams: 1
-      temperature: 0.8
-      num_return_sequences: 1
-    data_args:
-      template: qwen3
-    strategy_args:
-      # strategy_name: hf_infer
-      # strategy_config: null
-      strategy_name: vllm
-      strategy_config:
-        gpu_memory_utilization: 0.8
-        block_size: 16
-        max_model_len: 8000
-        load_format: auto
-    device_mapping: list(range(12,16))
-    infer_batch_size: 4
+    response_level_reward_type: "01"   # "01" = 二值(对1.0/错0.0)；"soft" = 四档(默认)
+    # 可选：格式 reward 类型
+    format_reward_type: format  
+  # code_sandbox:
+  #   use_local: true
+  #   worker_cls: roll.pipeline.rlvr.rewards.code_sandbox_reward_worker.CodeSandboxRewardWorker
+  #   tag_included: [KodCode]
+  #   model_args:
+  #     model_name_or_path: ${reward_pretrain}
+  #   data_args:
+  #     template: qwen2_5
+  #   world_size: 8
+  #   infer_batch_size: 1

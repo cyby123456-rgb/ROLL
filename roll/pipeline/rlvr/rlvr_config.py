@@ -39,6 +39,22 @@ class RewardConfig(WorkerConfig):
         default=True,
         metadata={"help": "Whether to use local code instead of downloading from URL."}
     )
+    livecodebench_data_dir: Optional[str] = field(
+        default=None,
+        metadata={"help": "Directory containing per-question LiveCodeBench pickle files."},
+    )
+    code_reward_timeout: int = field(
+        default=6,
+        metadata={"help": "Per-test timeout used by the GePPO-compatible code reward."},
+    )
+    code_reward_binary: bool = field(
+        default=True,
+        metadata={"help": "Return binary all-tests-passed rewards for GePPO code evaluation."},
+    )
+    code_reward_power4: bool = field(
+        default=False,
+        metadata={"help": "Raise partial GePPO code rewards to the fourth power when binary mode is disabled."},
+    )
     judge_prompt: str = field(
         default=None,
         metadata={"help": "The prompt for judge."}
@@ -63,6 +79,14 @@ class RewardConfig(WorkerConfig):
         default=None,
         metadata={"help": "The pattern of the answer format."}
     )
+    format_reward_type: Literal["format", "boxed"] = field(
+        default="format",
+        metadata={"help": "Format reward mode: XML-style format or a valid boxed answer."},
+    )
+    response_level_reward_type: Literal["01", "soft"] = field(
+        default="01",
+        metadata={"help": "Response reward mode: binary 0/1 or soft correctness/format scores."},
+    )
     reward_type: str = field(default=None, metadata={"help": "The type of the reward."})
     response_length_penalty_coef: float = field(default=0.0, metadata={"help": "The coefficient of the response length penalty."})
 
@@ -78,11 +102,51 @@ class RewardConfig(WorkerConfig):
 
 
 @dataclass
+class UpdateValidationConfig:
+    """Controls post-update validation and optional rollback of actor updates."""
+
+    enable: bool = False
+    batch_size: int = 16
+    num_return_sequences: int = 8
+    advantage_threshold_percentile: float = 25.0
+    acceptance_advantage_threshold: float = 0.0
+    acceptance_advantage_threshold_mode: Literal["fixed", "reverse_decay"] = "fixed"
+    acceptance_advantage_threshold_reverse_decay_start: float = 0.0
+    acceptance_advantage_threshold_reverse_decay_end: float = 0.0
+    acceptance_advantage_threshold_reverse_decay_steps: float = 100.0
+    min_steps_for_threshold: int = 10
+    buffer_size: int = 50
+    is_level: Literal["token", "seq"] = "seq"
+    data_mode: Literal["fixed", "rollout_batch", "random_per_step"] = "fixed"
+    est_mode: Literal["on-policy", "off-policy"] = "on-policy"
+    offpolicy_rollout_n: int = 1
+    generate_mode: Literal["legacy", "scheduler"] = "legacy"
+    generate_concurrency: int = 64
+    log_update_norm: bool = True
+    random_rollback_enable: bool = False
+    random_rollback_prob: float = 0.0
+    random_rollback_seed: Optional[int] = None
+    lr_adaptation_enable: bool = False
+    lr_adaptation_window: int = 100
+    lr_adaptation_interval: int = 100
+    lr_adaptation_high_rollback_rate: float = 0.5
+    lr_adaptation_low_rollback_rate: float = 0.1
+    lr_adaptation_decrease_factor: float = 0.5
+    lr_adaptation_increase_factor: float = 1.2
+    lr_adaptation_min_lr: Optional[float] = None
+    lr_adaptation_max_lr: Optional[float] = None
+
+
+@dataclass
 class RLVRConfig(PPOConfig):
     # global
     global_template: str = field(
         default=None,
         metadata={"help": "The template of the global."})
+    update_validation: UpdateValidationConfig = field(
+        default_factory=UpdateValidationConfig,
+        metadata={"help": "Post-update validation and rollback configuration."},
+    )
     dataset_filter: DatasetFilterConfig = field(
         default_factory=DatasetFilterConfig,
         metadata={"help": "Configuration for filtering dataset by source and difficulty"},
@@ -112,6 +176,14 @@ class RLVRConfig(PPOConfig):
     save_logging_board_dir: str = field(
         default=None, metadata={"help": "saving directory of logging board_metrics"}
     )
+    reward_system_config: Dict[str, Any] = field(default_factory=dict)
+    only_rollout: bool = field(default=False)
+    only_rollout_num_return_sequences: int = field(default=40)
+    only_rollout_source: Literal["train", "validation"] = field(default="train")
+    only_rollout_output_path: Optional[str] = field(default=None)
+    lr_decay_for_baseline: bool = field(default=False)
+    lr_decay_for_baseline_decay_steps: int = field(default=100)
+    lr_decay_for_baseline_min_lr: float = field(default=0.0)
 
     # role related
     validation: WorkerConfig = field(
@@ -149,8 +221,22 @@ class RLVRConfig(PPOConfig):
     importance_sampling: Literal["token", "seq"] = (
         field(default="token", metadata={"help": "policy importance sampling"})
     )
+    base_log_probs_mode: Literal["old", "infer", "auto"] = field(
+        default="old",
+        metadata={"help": "Base log-probs for PPO IS: old, infer, or auto."},
+    )
+    is_correction: Literal["default", "vanilla", "reverse"] = field(
+        default="default",
+        metadata={"help": "Train/infer mismatch correction applied to policy loss."},
+    )
     use_rollout_importance_sampling_ratio: bool = field(default=False, metadata={"help": "apply train/infer ratio as token-level loss weight"})
     rollout_importance_sampling_ratio_upper_bound: float = field(default=1.2)
+
+    use_mismatch_forward_kl_loss: bool = field(default=False)
+    use_mismatch_reverse_kl_loss: bool = field(default=False)
+    mismatch_kl_loss_coef: float = field(default=0.0)
+    mismatch_kl_is_ratio_clip_low: float = field(default=0.0)
+    mismatch_kl_is_ratio_clip_high: Optional[float] = field(default=10.0)
 
     train_infer_ratio_mask: bool = field(default=False, metadata={"help": "apply train/infer ratio as token-level response mask"})
     train_infer_ratio_threshold_low: float = field(default=0.8)
@@ -162,9 +248,29 @@ class RLVRConfig(PPOConfig):
     train_infer_ratio_seq_mask: bool = field(default=False, metadata={"help": "apply train/infer ratio as sequence-level response mask"})
     train_infer_ratio_seq_threshold_low: float = field(default=0.8)
     train_infer_ratio_seq_threshold_high: float = field(default=1.2)
+    train_infer_ratio_seq_product_mask: bool = field(default=False)
+    train_infer_ratio_seq_product_threshold_low: float = field(default=0.8)
+    train_infer_ratio_seq_product_threshold_high: float = field(default=1.2)
     train_infer_diff_seq_mask: bool = field(default=False, metadata={"help": "apply train-infer diff as sequence-level response mask"})
     train_infer_diff_seq_threshold_low: float = field(default=-0.2)
     train_infer_diff_seq_threshold_high: float = field(default=0.2)
+
+    train_infer_ratio_trunc_is: bool = field(default=False)
+    train_infer_ratio_trunc_is_low: float = field(default=0.5)
+    train_infer_ratio_trunc_is_high: float = field(default=2.0)
+    train_infer_ratio_trunc_is_normalize: bool = field(default=True)
+    train_infer_ratio_trunc_reverse_is: bool = field(default=False)
+    train_infer_ratio_trunc_reverse_is_low: float = field(default=0.5)
+    train_infer_ratio_trunc_reverse_is_high: float = field(default=2.0)
+    train_infer_ratio_trunc_reverse_is_normalize: bool = field(default=True)
+    ratio_rollout_dump_dir: Optional[str] = field(
+        default=None,
+        metadata={"help": "Directory to dump per-step train/infer IS ratio records for TIS analysis."},
+    )
+    ratio_dump_include_token_ratios: bool = field(
+        default=True,
+        metadata={"help": "Dump all valid token-level train/infer IS ratios for each sampled response."},
+    )
 
     val_greedy: bool = field(default=False, metadata={"help": "Use greedy for validation"})
     val_n_sample: int = field(default=1, metadata={"help": "Number of samples for validation"})

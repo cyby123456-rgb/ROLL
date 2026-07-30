@@ -69,6 +69,36 @@ class ActorWorker(Worker):
         # there is no chance to init platform context.
         current_platform.init()
 
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def sync_to_guard(self):
+        if not hasattr(self.strategy, "sync_to_guard"):
+            raise RuntimeError(f"{self.worker_name}: strategy does not support update-validation guard state")
+        return self.strategy.sync_to_guard()
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def sync_from_guard(self):
+        if not hasattr(self.strategy, "sync_from_guard"):
+            raise RuntimeError(f"{self.worker_name}: strategy does not support update-validation rollback")
+        return self.strategy.sync_from_guard()
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def compute_update_norm_from_guard(self):
+        if not hasattr(self.strategy, "compute_update_norm_from_guard"):
+            return None
+        return self.strategy.compute_update_norm_from_guard()
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def set_learning_rate(self, learning_rate: float):
+        if hasattr(self.strategy, "set_learning_rate"):
+            return self.strategy.set_learning_rate(learning_rate)
+        optimizer = getattr(self.strategy, "optimizer", None)
+        if optimizer is None:
+            return {"old_lr": None, "new_lr": None}
+        old_lrs = [group.get("lr") for group in optimizer.param_groups]
+        for group in optimizer.param_groups:
+            group["lr"] = learning_rate
+        return {"old_lr": old_lrs[0] if old_lrs else None, "new_lr": learning_rate}
+
     @register(dispatch_mode=Dispatch.DP_MP_DISPATCH_FIRST)
     def train_step(self, data: DataProto):
         """
@@ -436,6 +466,48 @@ class ActorWorker(Worker):
         data.meta_info["pad_token_id"] = self.tokenizer.pad_token_id
         response_call_back_fn = self.response_call_back_fns.pop(data.meta_info["request_id"])
         self.response_callback_refs.append(response_call_back_fn(data))
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL_ONE)
+    @torch.no_grad()
+    def generate_request(self, data: DataProto, timeout: float = 600.0):
+        """Submit one server request and synchronously return its raw output.
+
+        Update validation needs the vLLM ``output_logprobs`` emitted by the
+        server callback.  The regular ``generate`` path intentionally hides
+        that metadata, so this small adapter preserves the callback payload
+        while keeping the existing server lifecycle unchanged.
+        """
+        if self.thread_server is None or not self.strategy.running:
+            raise RuntimeError(
+                f"{self.worker_name}: generate_request requires start_server() to be active"
+            )
+
+        request_id = data.meta_info.get("request_id")
+        if not request_id:
+            request_id = f"request_{time.time_ns()}"
+            data.meta_info["request_id"] = request_id
+
+        done = threading.Event()
+        result = {}
+
+        def response_callback(response: DataProto):
+            result["data"] = response
+            done.set()
+            # stop_server() expects callback results to be Ray references.
+            return ray.put(response)
+
+        data.meta_info["response_callback_fn"] = response_callback
+        self.add_request(command=GenerateRequestType.ADD, data=data)
+        if not done.wait(timeout=timeout):
+            # Best-effort cancellation; leave the server usable for later
+            # validation requests even when one request times out.
+            try:
+                self.add_request(command=GenerateRequestType.ABORT, data=data)
+            except Exception:
+                pass
+            self.response_call_back_fns.pop(request_id, None)
+            raise TimeoutError(f"{self.worker_name}: request {request_id} timed out after {timeout}s")
+        return result["data"]
 
 
 class CriticWorker(Worker):

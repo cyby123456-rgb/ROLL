@@ -21,6 +21,25 @@ abort_lock = asyncio.Lock()
 stop_flag = False
 
 
+def _extract_logprob_value(prob_info):
+    """Normalize SGLang per-token logprob records across supported versions."""
+    if prob_info is None:
+        return None
+    if isinstance(prob_info, (float, int)):
+        return float(prob_info)
+    if isinstance(prob_info, dict):
+        for key in ("logprob", "log_prob", "value"):
+            if key in prob_info:
+                return float(prob_info[key])
+    if hasattr(prob_info, "logprob"):
+        return float(prob_info.logprob)
+    if hasattr(prob_info, "log_prob"):
+        return float(prob_info.log_prob)
+    if isinstance(prob_info, (list, tuple)) and len(prob_info) > 0:
+        return float(prob_info[0])
+    raise TypeError(f"Unsupported SGLang logprob record type: {type(prob_info)!r}")
+
+
 async def producer(thread_queue, asyncio_queue):
     PRODUCER_PUT_TIMEOUT = 15 * 60
     global stop_flag
@@ -60,10 +79,20 @@ async def consumer(asyncio_queue, consumer_id, llm, request_complete_callback):
         output_logprobs = [chunk["meta_info"].get("output_token_logprobs", None) for chunk in chunks]
         has_logprobs = any(logprobs is not None for logprobs in output_logprobs)
         if has_logprobs:
+            if not all(logprobs is not None for logprobs in output_logprobs):
+                logger.warning(
+                    "SGLang returned logprobs for only part of the sampled outputs; "
+                    "dropping output_logprobs for this request."
+                )
+                has_logprobs = False
+        if has_logprobs:
             lens = [min(len(ids), len(logprobs)) for ids, logprobs in zip(output_token_ids, output_logprobs)]
             output_token_ids = [ids[:l] for ids, l in zip(output_token_ids, lens)]
             output_logprobs = [logprobs[:l] for logprobs, l in zip(output_logprobs, lens)]
-            output_logprobs = [[prob_info[0] for prob_info in logprobs] for logprobs in output_logprobs]
+            output_logprobs = [
+                [_extract_logprob_value(prob_info) for prob_info in logprobs]
+                for logprobs in output_logprobs
+            ]
             output_data.meta_info["output_logprobs"] = output_logprobs
             assert all([len(ids) == len(logprobs) for ids, logprobs in zip(output_token_ids, output_logprobs)]), (
                 "output_token_ids and output_logprobs length not match"
