@@ -1527,3 +1527,182 @@ it restore `checkpoint-100` and proceed to step 101 or later.
 - Update statuses instead of duplicating entries.
 - Keep commands runnable from the repository root.
 - Preserve unrelated user changes.
+
+### 11. SGLang v0.4.6.post4 uvloop event-loop setup failure
+
+Observed error from the user's `sglang` Conda environment while launching
+`run_qwen3_1p7b_math_sglang_tis_uv_min800_4gpus.sh` on 2026-08-01:
+
+```text
+ray.exceptions.RayTaskError(RuntimeError): ray::ActorWorker.setup_collective_group()
+  File "roll/third_party/sglang/v046post4_patch/engine.py", line 28, in setup_collective_group
+    loop = asyncio.get_event_loop()
+  File "/root/miniconda3/envs/sglang/lib/python3.10/site-packages/uvloop/__init__.py", line 206, in get_event_loop
+    raise RuntimeError(
+RuntimeError: There is no current event loop in thread 'MainThread'.
+```
+
+Relevant dependency/config facts from the traceback and repository requirements:
+
+- Python path in traceback: `/root/miniconda3/envs/sglang/lib/python3.10`.
+- Active ROLL SGLang patch selected by the traceback:
+  `roll/third_party/sglang/v046post4_patch`, matching
+  `sglang[srt,torch-memory-saver]==0.4.6.post4` in
+  `requirements_torch260_sglang.txt`.
+- The failing event-loop policy is uvloop, from the traceback frame in
+  `uvloop/__init__.py`.
+- The launcher is using `SGLANG_QUANTIZATION=fp8`, `SGLANG_TP_SIZE=1`,
+  `MEGATRON_TRANSFORMER_IMPL=transformer_engine`, and
+  `GENERATE_OPT_LEVEL=0`.
+
+Confirmed cause: ROLL's SGLang engine patch used `asyncio.get_event_loop()` in
+synchronous model-update methods. Under the current uvloop/Python 3.10 runtime,
+Ray actor `MainThread` has no pre-created current loop at the time
+`actor_infer-0` executes `setup_collective_group`, so `get_event_loop()` raises
+before the collective group is created. This is not an SGLang model/env install
+failure; it is missing event-loop initialization in the ROLL SGLang patch.
+
+Code change applied:
+
+- `roll/third_party/sglang/v046post4_patch/engine.py`: added
+  `_ensure_event_loop()` that creates and installs a new loop when
+  `asyncio.get_event_loop()` raises `RuntimeError`; all synchronous SGLang
+  model-update entrypoints now use that helper before `run_until_complete()`.
+
+Verification performed:
+
+```text
+PYTHONPYCACHEPREFIX=/tmp/roll_pycache python -m py_compile roll/third_party/sglang/v046post4_patch/engine.py
+py_compile exit=0
+```
+
+A direct import/runtime helper check in this Codex shell could not be completed
+because this shell's `python` could not import `sglang`. Runtime observation from
+the user's rerun did, however, show all `actor_infer` workers start their SGLang
+async services and reach a SGLang prefill request. That occurs after
+`setup_collective_group`, so the event-loop fix is confirmed to pass the
+original failure point. Any subsequent traceback should be recorded separately.
+
+### 12. SGLang update-validation async request does not complete
+
+Initial observation after applying the event-loop fix on 2026-08-01:
+
+```text
+(ActorWorker(actor_infer-2) ...) Prefill batch. #new-seq: 1,
+#new-token: 130, #cached-token: 0, token usage: 0.00, #running-req: 0,
+#queue-req: 0
+```
+
+Confirmed configuration/path facts:
+
+- `rlvr_config.yaml` sets `eval_steps: 25`, `response_length: 8192`, and
+  `validation.generating_args.max_new_tokens: ${response_length}`.
+- The validation file `data/math_benchmarks_0710_newest.jsonl` has 2032 rows.
+- `RLVRPipeline.run()` runs validation whenever `global_step % eval_steps == 0`,
+  which includes the first iteration at `global_step == 0`.
+- `RLVRPipeline.val()` calls the validation scheduler with
+  `batch_size=len(self.val_dataset)`, so the initial evaluation requests all
+  2032 prompts before regular rollout and training begin.
+
+The later driver and worker logs correct the initial interpretation: ordinary
+validation completed successfully at `14:32:59` and the first ordinary rollout
+completed at `14:33:55` (`prepare_cached_rollout: cached batch_size=512`). The
+driver then saved the guard state at `14:34:39`, and at `14:36:06` entered
+`_generate_validation_batch`, logging its sampled UV prompt fields. All four
+`actor_infer` workers then logged `generate server global step 0` and
+`[sglang asyncio] env setup (done)`. `actor_infer-2` subsequently logged the
+first SGLang prefill, but no request-completion callback or later driver log
+appeared.
+
+Confirmed scope: this is the post-training `update_validation` path, not the
+regular `validation:` benchmark path and not the event-loop initialization
+fix. `RLVRPipeline._generate_validation_batch()` unconditionally starts the
+asynchronous server and, in legacy mode, calls the blocking
+`ActorWorker.generate_request()` path. Each such request waits up to 600
+seconds for the callback. The current UV configuration uses 32 prompts, 8
+responses per prompt, and `max_new_tokens=8192`; the SGLang stream for the
+first request is not yielding a terminal callback after prefill.
+
+The run directory name contains `nouv`, but the runtime proof above (guard
+sync plus `Update Validation:` log) means `update_validation.enable` was true
+in that run. This should be treated as a configuration/UV-path issue, not as a
+successful no-UV run.
+
+Status: the exact SGLang 0.4.6.post4 stream/callback compatibility cause is
+not yet verified. First isolate it by rerunning with
+`update_validation.enable=false`; ordinary validation, ordinary rollout, and
+the train/update path have all progressed past the relevant points in the
+observed run. For a UV smoke test, reduce the UV request to one prompt, one
+sample, and a short response before restoring the 32 x 8 x 8192 workload.
+
+### 13. SGLang update-validation metrics-only synchronous path
+
+Goal: collect update-validation (UV) metrics with SGLang without rollback. The
+user does not require rollback or update-norm metrics for this run.
+
+Confirmed cause and scope:
+
+- The normal SGLang `SgLangStrategy.model.generate()` path completed ordinary
+  rollout generation in the affected run.
+- The stuck path is specifically ROLL's UV async lifecycle:
+  `start_server -> async_engine -> tokenizer_manager.generate_request(stream=True)
+  -> callback`. The first prefill is logged but the callback does not complete.
+- This is independent of the earlier missing uvloop event-loop issue. That
+  issue was passed after the `EngineSA` event-loop fix.
+
+Code changes applied:
+
+- `roll/distributed/strategy/sglang_strategy.py` now provides
+  `SgLangStrategy.generate_with_logprobs()`. It uses synchronous SGLang Engine
+  generation with `return_logprob=True` and returns response token IDs aligned
+  one-for-one with their SGLang output token logprobs.
+- `roll/pipeline/base_worker.py` adds
+  `ActorWorker.generate_request_sync()`, a Ray actor method that exposes that
+  synchronous SGLang result in the existing UV callback-data format.
+- `roll/pipeline/rlvr/rlvr_pipeline.py` selects that synchronous method only
+  when `actor_infer.strategy_args.strategy_name=sglang`; it does not call
+  `actor_infer.start_server()` or `stop_server()` for SGLang UV. vLLM and other
+  strategies retain their legacy/scheduler paths.
+- `UpdateValidationConfig` has `metrics_only: bool = False`. With it enabled,
+  UV still syncs the post-update actor to inference, generates the validation
+  batch, and records advantage metrics, but always accepts the update and does
+  not call rollback or LR adaptation.
+- `run_qwen3_1p7b_math_sglang_tis_uv_min800_4gpus.sh` exposes
+  `UV_ENABLE` (default `false`), `UV_METRICS_ONLY` (default `true`), and
+  `UV_LOG_UPDATE_NORM` (default `false`). The last setting prevents the
+  otherwise-default guard-model/optimizer copy, which metrics-only UV does not
+  need. Set it to `true` only when update-norm metrics are explicitly wanted.
+
+Static verification performed:
+
+```text
+py_compile: passed (SGLang strategy, worker, config, and pipeline)
+bash -n: passed (SGLang UV launcher)
+git diff --check: passed
+UV SGLang metrics-only AST contract: OK
+```
+
+All static checks passed. A direct SGLang import/runtime test cannot run in the
+managed Codex shell because this shell lacks the user's SGLang Python package;
+therefore do not mark this path runtime-verified until a GPU run completes a UV
+step.
+
+Required first runtime command from the user's SGLang environment:
+
+```bash
+ray stop --force
+UV_ENABLE=true UV_METRICS_ONLY=true UV_LOG_UPDATE_NORM=false EXP_NAME=qwen3-1p7b-math-sglang-tis-uv-metrics-4g-s42-0801 SGLANG_MEM_FRACTION_STATIC=0.6 SGLANG_TP_SIZE=1 SGLANG_QUANTIZATION=fp8 MEGATRON_TRANSFORMER_IMPL=transformer_engine GENERATE_OPT_LEVEL=0 bash examples/qwen3-8B-rlvr_megatron/run_qwen3_1p7b_math_sglang_tis_uv_min800_4gpus.sh
+```
+
+Expected proof in the driver log after the actor update:
+
+```text
+SGLang UV synchronous generation completed ...
+Update Validation: Generated batch with infer_logprobs=True
+UV metrics recorded without rollback or LR adaptation.
+```
+
+Next pending step: observe the above lines plus completion of one training
+step in the real SGLang GPU environment. If `output_token_logprobs` is absent
+there, preserve the new exception and record the exact SGLang response shape;
+the normal rollout should still remain unaffected.

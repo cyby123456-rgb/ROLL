@@ -9,8 +9,8 @@ CUDA_LD_LIBRARY_PATH="${CUDA_HOME:-/usr/local/cuda}/lib64:${CUDA_HOME:-/usr/loca
 export LD_LIBRARY_PATH="${CUDA_LD_LIBRARY_PATH}:${NVIDIA_LD_LIBRARY_PATH}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 
 EXP_NAME="${EXP_NAME:-qwen3-1p7b-math-sglang-baseline-4g-s42}"
-EXP_ROOT="${EXP_ROOT:-/mnt/shared-storage-user/liujinyi/lj/rlvr_runs/${EXP_NAME}}"
-MODEL_PATH="${MODEL_PATH:-/mnt/shared-storage-user/liujinyi/models_hf/Qwen3-1.7B}"
+EXP_ROOT="${EXP_ROOT:-/inspire/hdd/project/traffic-congestion-management/zhangqiaosheng-24045/dist/rlvr_runs/${EXP_NAME}}"
+MODEL_PATH="${MODEL_PATH:-/inspire/hdd/project/traffic-congestion-management/zhangqiaosheng-24045/dist/models/Qwen3-1.7B}"
 TEMPLATE="${TEMPLATE:-qwen2_5}"
 MAX_STEPS="${MAX_STEPS:-800}"
 SGLANG_MEM_FRACTION_STATIC="${SGLANG_MEM_FRACTION_STATIC:-0.6}"
@@ -44,9 +44,8 @@ exec bash "${SCRIPT_DIR}/run_rlvr_pipeline.sh" \
   "logging_dir=${EXP_ROOT}/logs" \
   "checkpoint_config.output_dir=${EXP_ROOT}/checkpoints" \
   "tracker_kwargs.log_dir=${EXP_ROOT}/wandb" \
-  "+tracker_kwargs.name=${EXP_NAME}" \
-  "+system_envs.LD_LIBRARY_PATH=${LD_LIBRARY_PATH}" \
-  "+generate_opt_level=${GENERATE_OPT_LEVEL}" \
+  "++tracker_kwargs.name=${EXP_NAME}" \
+  "++generate_opt_level=${GENERATE_OPT_LEVEL}" \
   "actor_train.data_args.template=${TEMPLATE}" \
   "actor_infer.data_args.template=${TEMPLATE}" \
   "reference.data_args.template=${TEMPLATE}" \

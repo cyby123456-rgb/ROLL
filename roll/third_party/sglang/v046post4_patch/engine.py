@@ -12,6 +12,15 @@ from roll.third_party.sglang.io_struct import (
 import sglang.srt.entrypoints.engine as engine_module
 
 
+def _ensure_event_loop():
+    try:
+        return asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        return loop
+
+
 class EngineSA(Engine):
 
     def setup_collective_group(
@@ -25,7 +34,7 @@ class EngineSA(Engine):
             backend=backend,
             rank_in_cluster=rank_in_cluster,
         )
-        loop = asyncio.get_event_loop()
+        loop = _ensure_event_loop()
         return loop.run_until_complete(
             self.tokenizer_manager.setup_collective_group(obj, None)
         )
@@ -41,7 +50,7 @@ class EngineSA(Engine):
             meta_infos=meta_infos,
             bucket_size=bucket_size,
         )
-        loop = asyncio.get_event_loop()
+        loop = _ensure_event_loop()
         return loop.run_until_complete(
             self.tokenizer_manager.broadcast_bucket(obj, None)
         )
@@ -59,7 +68,7 @@ class EngineSA(Engine):
             shape=shape,
             parameter_name=parameter_name,
         )
-        loop = asyncio.get_event_loop()
+        loop = _ensure_event_loop()
         return loop.run_until_complete(
             self.tokenizer_manager.broadcast_parameter(obj, None)
         )
@@ -75,7 +84,7 @@ class EngineSA(Engine):
             weight=weight,
             ranks_in_worker=ranks_in_worker,
         )
-        loop = asyncio.get_event_loop()
+        loop = _ensure_event_loop()
         return loop.run_until_complete(
             self.tokenizer_manager.update_parameter(obj, None)
         )
@@ -92,7 +101,7 @@ class EngineSA(Engine):
             buffer=buffer,
             ranks_in_worker=ranks_in_worker,
         )
-        loop = asyncio.get_event_loop()
+        loop = _ensure_event_loop()
         return loop.run_until_complete(
             self.tokenizer_manager.update_parameter_in_bucket(obj, None)
         )

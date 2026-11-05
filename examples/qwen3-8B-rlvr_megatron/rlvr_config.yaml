@@ -23,7 +23,7 @@ tracker_kwargs:
   mode: offline
   log_dir: /mnt/shared-storage-user/liujinyi/lj/ROLL
 
-num_gpus_per_node: 4
+num_gpus_per_node: 8
 
 max_steps: 800
 save_steps: 100
@@ -224,7 +224,7 @@ actor_infer:
       gpu_memory_utilization: 0.6
       block_size: 16
       # quantization: fp8  # supported ROLL modes: fp8, int8, fp16
-  device_mapping: list(range(0,4))
+  device_mapping: list(range(4,8))
   infer_batch_size: 1
   # system_envs:
   #   VLLM_USE_FLASHINFER_SAMPLER: '0'

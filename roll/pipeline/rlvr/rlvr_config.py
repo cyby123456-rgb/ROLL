@@ -106,6 +106,7 @@ class UpdateValidationConfig:
     """Controls post-update validation and optional rollback of actor updates."""
 
     enable: bool = False
+    metrics_only: bool = False
     batch_size: int = 16
     num_return_sequences: int = 8
     advantage_threshold_percentile: float = 25.0

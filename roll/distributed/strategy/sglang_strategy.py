@@ -32,6 +32,25 @@ except:
 logger = get_logger()
 
 
+def _extract_logprob_value(prob_info):
+    """Normalize SGLang token logprob records returned by supported versions."""
+    if prob_info is None:
+        return None
+    if isinstance(prob_info, (float, int)):
+        return float(prob_info)
+    if isinstance(prob_info, dict):
+        for key in ("logprob", "log_prob", "value"):
+            if key in prob_info:
+                return float(prob_info[key])
+    if hasattr(prob_info, "logprob"):
+        return float(prob_info.logprob)
+    if hasattr(prob_info, "log_prob"):
+        return float(prob_info.log_prob)
+    if isinstance(prob_info, (list, tuple)) and prob_info:
+        return float(prob_info[0])
+    raise TypeError(f"Unsupported SGLang logprob record type: {type(prob_info)!r}")
+
+
 def _ensure_event_loop():
     try:
         return asyncio.get_event_loop()
@@ -225,6 +244,33 @@ class SgLangStrategy(InferenceStrategy):
         self.sampling_params = old_sampling_params
 
         return output
+
+    def generate_with_logprobs(self, batch: DataProto, generation_config):
+        """Return final SGLang responses and logprobs without the async server."""
+        sampling_params = create_sampling_params_for_sglang(gen_kwargs=generation_config)
+        if not sampling_params.get("return_logprob"):
+            raise ValueError("SGLang UV generation requires generation_config.logprobs > 0")
+
+        prompt_token_ids = gather_unpadded_input_ids(
+            input_ids=batch.batch["input_ids"], attention_mask=batch.batch["attention_mask"]
+        )
+        outputs = self.model.generate(input_ids=prompt_token_ids, sampling_params=sampling_params)
+
+        output_token_ids = []
+        output_logprobs = []
+        for output in outputs:
+            token_ids = output.get("output_ids", [])
+            logprobs = output.get("meta_info", {}).get("output_token_logprobs")
+            if logprobs is None:
+                raise RuntimeError("SGLang did not return output_token_logprobs for UV generation")
+            # postprocess_generate requires one logprob for every returned token.
+            length = min(len(token_ids), len(logprobs))
+            output_token_ids.append(token_ids[:length])
+            output_logprobs.append([_extract_logprob_value(item) for item in logprobs[:length]])
+
+        if len(output_token_ids) != len(output_logprobs):
+            raise RuntimeError("SGLang UV output token IDs and logprobs have different counts")
+        return output_token_ids, output_logprobs
 
     # 参数同步相关接口
     def setup_collective_group(self, model_update_name, comm_plan, backend=None):

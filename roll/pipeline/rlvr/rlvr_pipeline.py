@@ -192,6 +192,7 @@ class RLVRPipeline(BasePipeline):
         # 初始化 update_validation_enabled（guard model 会在 strategy.initialize() 时创建）
         uv_config = self.pipeline_config.update_validation
         self.update_validation_enabled = uv_config.enable
+        self.uv_metrics_only = bool(uv_config.metrics_only)
         self.uv_log_update_norm = uv_config.log_update_norm
 
         # ===== Random Rollback (与 UV 互斥；UV 优先) =====
@@ -1034,6 +1035,28 @@ class RLVRPipeline(BasePipeline):
             )
         return index_to_response
 
+    def _generate_validation_requests_sglang_sync(
+        self,
+        single_prompts: List[DataProto],
+    ) -> Dict[int, DataProto]:
+        """Use the proven synchronous SGLang generation path for UV metrics."""
+        index_to_response = {}
+        num_workers = len(self.actor_infer.workers)
+        for start in range(0, len(single_prompts), num_workers):
+            indexed_prompts = list(enumerate(single_prompts[start : start + num_workers], start=start))
+            responses = ray.get(
+                [
+                    self.actor_infer.workers[index % num_workers].generate_request_sync.remote(prompt)
+                    for index, prompt in indexed_prompts
+                ]
+            )
+            index_to_response.update(dict(zip((index for index, _ in indexed_prompts), responses)))
+            logger.info(
+                f"SGLang UV synchronous generation completed "
+                f"{min(start + num_workers, len(single_prompts))}/{len(single_prompts)} prompts"
+            )
+        return index_to_response
+
     def _generate_validation_requests_scheduler(
         self,
         single_prompts: List[DataProto],
@@ -1118,10 +1141,11 @@ class RLVRPipeline(BasePipeline):
         # update_validation 必须在 train 之后用新策略（已同步到 actor_infer）对固定验证集再生成一次。
         batch_size = validation_prompts.batch["input_ids"].shape[0]
 
-        # Both request modes use the asynchronous inference server lifecycle.
-        self.actor_infer.start_server(
-            data=DataProto(meta_info={"global_step": global_step, "is_offload_states": False})
-        )
+        is_sglang = self.pipeline_config.actor_infer.strategy_args.strategy_name == "sglang"
+        if not is_sglang:
+            self.actor_infer.start_server(
+                data=DataProto(meta_info={"global_step": global_step, "is_offload_states": False})
+            )
 
         # 3.1 为每个 prompt 创建一个 inference 请求。
         single_prompts: List[DataProto] = []
@@ -1148,7 +1172,9 @@ class RLVRPipeline(BasePipeline):
             single_prompts.append(single_prompt)
 
         try:
-            if self.uv_generate_mode == "scheduler":
+            if is_sglang:
+                index_to_response = self._generate_validation_requests_sglang_sync(single_prompts)
+            elif self.uv_generate_mode == "scheduler":
                 index_to_response = self._generate_validation_requests_scheduler(single_prompts)
             else:
                 index_to_response = self._generate_validation_requests_legacy(single_prompts)
@@ -1157,7 +1183,8 @@ class RLVRPipeline(BasePipeline):
                 ray.get(self.uv_request_scheduler.abort_request.remote())
             raise
         finally:
-            self.actor_infer.stop_server()
+            if not is_sglang:
+                self.actor_infer.stop_server()
 
         # 3.3 按 index 顺序处理每个 response，整理为 raw_outputs_data
         raw_outputs_data = []
@@ -1761,6 +1788,15 @@ class RLVRPipeline(BasePipeline):
             metrics["validation/advantage_threshold"] = self.uv_advantage_threshold
         current_acceptance_threshold = self._get_acceptance_advantage_threshold(global_step)
         metrics["validation/acceptance_advantage_threshold_current"] = current_acceptance_threshold
+
+        if self.uv_metrics_only:
+            self.uv_rollback_history.append(0.0)
+            metrics["validation/metrics_only"] = 1.0
+            metrics["validation/update_accepted"] = 1.0
+            metrics["validation/rollback_rate_last_100"] = 0.0
+            metrics["validation/lr_adaptation_rollback_rate_window"] = 0.0
+            logger.info(f"Step {global_step}: UV metrics recorded without rollback or LR adaptation.")
+            return True, metrics
 
         # 4. 判断是否接受更新
         rollback_happened = False
@@ -2615,7 +2651,11 @@ class RLVRPipeline(BasePipeline):
                     self._push_offpolicy_rollout_history(global_step=global_step, rollout_batch=batch)
                 # ===== Update Validation: 保存状态到 guard（训练更新前）=====
                 # 在 Megatron 模型更新之前，保存当前模型状态到 guard
-                if self.update_validation_enabled or self.uv_log_update_norm or self.random_rollback_enable:
+                if (
+                    (self.update_validation_enabled and not self.uv_metrics_only)
+                    or self.uv_log_update_norm
+                    or self.random_rollback_enable
+                ):
                     with Timer(name="save_guard_state", logger=None) as guard_state_timer:
                         self._sync_to_guard(global_step)
                     metrics_mgr.add_metric("time/save_guard_state", guard_state_timer.last)

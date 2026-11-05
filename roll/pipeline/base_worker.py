@@ -509,6 +509,31 @@ class ActorWorker(Worker):
             raise TimeoutError(f"{self.worker_name}: request {request_id} timed out after {timeout}s")
         return result["data"]
 
+    @torch.no_grad()
+    def generate_request_sync(self, data: DataProto):
+        """Generate a UV request through SGLang's synchronous Engine API."""
+        if not hasattr(self.strategy, "generate_with_logprobs"):
+            raise RuntimeError(f"{self.worker_name}: synchronous UV requests require the SGLang strategy")
+
+        generation_config = data.meta_info["generation_config"]
+        generation_config["eos_token_id"] = [self.tokenizer.eos_token_id, self.tokenizer.pad_token_id]
+        generation_config["pad_token_id"] = self.tokenizer.pad_token_id
+        data = data.to(current_platform.device_type)
+        try:
+            output_token_ids, output_logprobs = self.strategy.generate_with_logprobs(data, generation_config)
+        finally:
+            data.to("cpu")
+        return DataProto(
+            meta_info={
+                **data.meta_info,
+                "output_token_ids": output_token_ids,
+                "output_logprobs": output_logprobs,
+                "finish_reasons": ["stop" for _ in output_token_ids],
+                "eos_token_id": self.tokenizer.eos_token_id,
+                "pad_token_id": self.tokenizer.pad_token_id,
+            }
+        )
+
 
 class CriticWorker(Worker):
 
